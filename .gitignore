@@ -1,0 +1,14 @@
+/target
+/lance_history
+*.log
+debug.log
+dig_debug.log
+err.log
+list_cache.rs
+query_lance.py
+test2.sh
+test3.sh
+test_empty.sh
+test_eof
+test_eof.rs
+.logs/

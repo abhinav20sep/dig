@@ -1,0 +1,27 @@
+# Dig Configuration
+# Copy this file to config.toml and adjust for your setup.
+
+default_model = "openai/gpt-4o-mini"
+max_ttl = 5
+max_turns_per_agent = 10
+token_budget = 500000
+tokens_per_minute = 90000
+max_concurrent_processes = 50
+global_timeout_secs = 120
+
+[[providers]]
+name = "openai"
+api_base = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-4o-mini"
+
+# [[providers]]
+# name = "ollama"
+# api_base = "http://localhost:11434"
+# model = "llama3"
+
+# [[providers]]
+# name = "anthropic"
+# api_base = "https://api.anthropic.com"
+# api_key_env = "ANTHROPIC_API_KEY"
+# model = "claude-sonnet-4-20250514"

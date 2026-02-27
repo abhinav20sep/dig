@@ -1,0 +1,50 @@
+# Dig Tool Manifest
+# Each entry describes a tool the agent can invoke.
+# Fields:
+#   name        - unique identifier
+#   description - what the LLM sees in its context
+#   command     - the binary to execute
+#   args        - default arguments (can be overridden by the agent)
+#   tier        - "safe" | "confirm" | "sandbox"
+
+[[tools]]
+name = "list_files"
+description = "List files in a directory"
+command = "ls"
+args = ["-la"]
+tier = "safe"
+
+[[tools]]
+name = "read_file"
+description = "Read the contents of a file"
+command = "cat"
+args = []
+tier = "safe"
+
+[[tools]]
+name = "search_text"
+description = "Search for a pattern in files using ripgrep"
+command = "rg"
+args = ["--json"]
+tier = "safe"
+
+[[tools]]
+name = "git_status"
+description = "Show the current git status"
+command = "git"
+args = ["status"]
+tier = "safe"
+
+[[tools]]
+name = "write_file"
+description = "Write content to a file using tee"
+command = "tee"
+args = []
+tier = "confirm"
+
+[[tools]]
+name = "bash"
+description = "Execute any shell command"
+command = "bash"
+args = ["-c"]
+tier = "confirm"
