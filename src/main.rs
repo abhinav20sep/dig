@@ -2,14 +2,16 @@ mod config;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use clap::Parser;
 use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
+use serde::Serialize;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-use tracing_subscriber;
 
-use agent_core::agent_loop::{AgentLoop, AgentLoopResult, ToolPermitter};
+use agent_core::agent_loop::{AgentLoop, AgentLoopResult, DryRunCommand, ToolPermitter};
 use agent_core::governor::{BudgetEnforcer, TokenCounter, TokenGovernor};
 use agent_core::memory::HybridMemory;
 use agent_core::protocol::*;
@@ -19,11 +21,130 @@ use agent_core::sandbox::{ProcessSandbox, SecurityTier, classify_command};
 use chrono::Utc;
 use uuid::Uuid;
 
-struct CliPermitter;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── CLI Argument Definition ─────────────────────────────────────
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "dig",
+    version,
+    about = "Natural language agentic terminal executor",
+    long_about = "Ask questions in plain English, get bash commands executed for you.\n\n\
+                   Examples:\n  \
+                   dig what is my ip\n  \
+                   dig find all rust files larger than 10KB\n  \
+                   cat file.txt | dig summarize this\n  \
+                   dig  (interactive REPL mode)",
+    trailing_var_arg = true
+)]
+struct Cli {
+    /// Enable debug traces (full LLM request/response dumps to stderr).
+    /// Equivalent to setting DIG_DEBUG=1.
+    #[arg(short, long)]
+    debug: bool,
+
+    /// Show generated bash commands without executing them.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Override LLM model for this invocation (e.g. "openai/gpt-4o").
+    #[arg(short, long, value_name = "MODEL")]
+    model: Option<String>,
+
+    /// Auto-approve all security tier prompts (Safe, Confirm, Sandbox).
+    /// WARNING: Dangerous — commands execute without confirmation.
+    #[arg(short, long)]
+    yes: bool,
+
+    /// Output results as structured JSON (one-shot mode only).
+    #[arg(long)]
+    json: bool,
+
+    /// Path to config file (overrides default search order).
+    #[arg(short, long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Restrict to read-only commands.
+    #[arg(long)]
+    read_only: bool,
+
+    /// Only allow Safe-tier commands. Deny Confirm and Sandbox tiers.
+    #[arg(long)]
+    safe_only: bool,
+
+    /// Skip Jaccard command cache — force a fresh LLM call.
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Disable LanceDB semantic history for this session.
+    #[arg(long)]
+    no_memory: bool,
+
+    /// Natural language query. Everything not a recognized flag becomes
+    /// part of the query. Use `--` to pass flag-like words as query text.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    query: Vec<String>,
+}
+
+// ── JSON Output Types ───────────────────────────────────────────
+
+#[derive(Serialize)]
+struct JsonSuccess {
+    success: bool,
+    result: String,
+}
+
+#[derive(Serialize)]
+struct JsonError {
+    success: bool,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct JsonDryRun {
+    success: bool,
+    dry_run: bool,
+    commands: Vec<JsonDryRunCommand>,
+}
+
+#[derive(Serialize)]
+struct JsonDryRunCommand {
+    command: String,
+    purpose: String,
+    run_as: String,
+    destructive: bool,
+}
+
+// ── Permitter ───────────────────────────────────────────────────
+
+struct CliPermitter {
+    auto_approve: bool,
+    safe_only: bool,
+}
 
 #[async_trait]
 impl ToolPermitter for CliPermitter {
     async fn check_permission(&self, command: &str, args: &[String]) -> Result<bool> {
+        // --safe-only takes precedence: deny anything not Safe
+        if self.safe_only {
+            let tier = classify_command(command);
+            if tier != SecurityTier::Safe {
+                eprintln!(
+                    "  ✗ Denied: '{}' is {:?} tier (--safe-only active)",
+                    command, tier
+                );
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        // --yes: auto-approve everything
+        if self.auto_approve {
+            return Ok(true);
+        }
+
+        // Default interactive behavior
         let full_cmd = format!("{} {}", command, args.join(" "));
         let tier = classify_command(command);
 
@@ -57,13 +178,200 @@ impl ToolPermitter for CliPermitter {
     }
 }
 
+// ── Model Validation ────────────────────────────────────────────
+
+fn validate_model_format(model: &str) -> bool {
+    !model.is_empty()
+        && !model.contains(' ')
+        && model
+            .chars()
+            .all(|c| c.is_alphanumeric() || "/-_.:".contains(c))
+}
+
+fn is_model_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    (msg.contains("model") && (msg.contains("not found") || msg.contains("invalid")))
+        || msg.contains("does not exist")
+        || msg.contains("unsupported model")
+}
+
+// ── Pipeline Builder ────────────────────────────────────────────
+
+struct Pipeline {
+    agent_loop: AgentLoop,
+    governor: TokenGovernor,
+    tools: Vec<agent_core::models::ToolManifestEntry>,
+    token_budget: u64,
+}
+
+async fn build_pipeline(
+    app_config: &agent_core::models::AppConfig,
+    model_override: Option<&str>,
+    permitter: Arc<dyn ToolPermitter>,
+    dry_run: bool,
+    no_cache: bool,
+    no_memory: bool,
+) -> Result<Pipeline> {
+    let mut openai_cfg = app_config
+        .providers
+        .iter()
+        .find(|p| p.name == "openai")
+        .cloned()
+        .unwrap_or_else(|| agent_core::models::ProviderConfig {
+            name: "openai".into(),
+            api_base: "https://api.openai.com/v1".into(),
+            api_key_env: Some("OPENAI_API_KEY".into()),
+            model: app_config.default_model.clone(),
+        });
+
+    if let Some(m) = model_override {
+        openai_cfg.model = m.to_string();
+    }
+
+    let api_key = std::env::var(
+        openai_cfg
+            .api_key_env
+            .as_deref()
+            .unwrap_or("OPENAI_API_KEY"),
+    )
+    .unwrap_or_else(|_| "dummy_key".into());
+
+    let embedder = Arc::new(OpenAiEmbeddings::new(
+        api_key.clone(),
+        openai_cfg.api_base.clone(),
+        "text-embedding-3-small".into(),
+    )?);
+
+    let provider: Arc<dyn agent_core::traits::LlmProvider> = Arc::new(OpenAiProvider::new(
+        openai_cfg.name,
+        api_key,
+        openai_cfg.api_base,
+        openai_cfg.model,
+    )?);
+
+    let token_counter = Arc::new(TokenCounter::new("cl100k_base"));
+    let governor = TokenGovernor::new(app_config.tokens_per_minute, app_config.token_budget)?;
+    let enforcer = BudgetEnforcer::new(app_config.max_ttl, app_config.max_turns_per_agent);
+
+    let process_sandbox = Arc::new(ProcessSandbox::new(
+        app_config.max_concurrent_processes,
+        app_config.global_timeout_secs,
+    ));
+
+    let memory = Arc::new(
+        HybridMemory::new(
+            "./lance_history",
+            token_counter.clone(),
+            8000,
+            embedder,
+            provider.clone(),
+        )
+        .await?,
+    );
+
+    let config_dir = match &std::env::var("DIG_CONFIG_DIR") {
+        Ok(d) => Some(std::path::Path::new(d.as_str()).to_path_buf()),
+        Err(_) => None,
+    };
+    let tools = config::load_tools(config_dir.as_deref())?;
+
+    let mut agent_loop = AgentLoop::new(
+        provider,
+        memory,
+        process_sandbox,
+        governor.clone(),
+        enforcer,
+        permitter,
+        tools.clone(),
+    );
+    agent_loop.dry_run = dry_run;
+    agent_loop.no_cache = no_cache;
+    agent_loop.no_memory = no_memory;
+
+    Ok(Pipeline {
+        agent_loop,
+        governor,
+        tools,
+        token_budget: app_config.token_budget,
+    })
+}
+
+// ── Envelope Builder ────────────────────────────────────────────
+
+fn build_envelope(
+    query: &str,
+    pipe_position: &str,
+    interactive: bool,
+    tty_available: bool,
+    read_only: bool,
+) -> MessageEnvelope<ExecutorPayload> {
+    MessageEnvelope {
+        proto_version: "1.1".to_string(),
+        msg_id: Uuid::new_v4().to_string(),
+        session_id: Uuid::new_v4().to_string(),
+        parent_id: None,
+        timestamp: Utc::now(),
+        direction: Direction::ExecToBrain,
+        priority: Priority::Normal,
+        tags: vec![],
+        payload: ExecutorPayload::Query(agent_core::protocol::QueryPayload {
+            intent: Intent::Freeform,
+            context: agent_core::protocol::harvest_context(
+                pipe_position.to_string(),
+                interactive,
+                tty_available,
+            ),
+            query: query.to_string(),
+            attachments: vec![],
+            constraints: Constraints {
+                read_only,
+                no_reboot: true,
+                no_service_restart: vec![],
+                max_downtime: "0s".into(),
+                approved_scope: vec![],
+                forbidden: vec![],
+            },
+            history_refs: vec![],
+        }),
+    }
+}
+
+// ── Dry-Run Formatting ──────────────────────────────────────────
+
+fn format_dry_run(commands: &[DryRunCommand]) -> String {
+    let mut out = String::from("[dry-run] Would execute:\n");
+    for (i, cmd) in commands.iter().enumerate() {
+        out.push_str(&format!(
+            "  {}. {}",
+            i + 1,
+            cmd.command
+        ));
+        if !cmd.purpose.is_empty() {
+            out.push_str(&format!("    ({})", cmd.purpose));
+        }
+        if cmd.destructive {
+            out.push_str("  [DESTRUCTIVE]");
+        }
+        if cmd.run_as != "user" {
+            out.push_str(&format!("  [run_as: {}]", cmd.run_as));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// ── Main ────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ── Determine mode: one-shot (args) or REPL (no args) ──
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = Cli::parse();
 
-    use std::io::IsTerminal;
+    // --debug: set env var so agent_loop.rs and memory.rs pick it up
+    if cli.debug {
+        unsafe { std::env::set_var("DIG_DEBUG", "1"); }
+    }
 
+    // ── Determine pipe / TTY state ──
     let stdout_is_pipe = !std::io::stdout().is_terminal();
     let stdin_is_pipe = !std::io::stdin().is_terminal();
     let has_tty = std::fs::File::open("/dev/tty").is_ok();
@@ -79,7 +387,7 @@ async fn main() -> Result<()> {
     let interactive = has_tty;
     let tty_available = has_tty;
 
-    // Check if stdin is a pipe (not a terminal)
+    // ── Read piped stdin ──
     let piped_input = if stdin_is_pipe {
         use std::io::Read;
         let mut buf = String::new();
@@ -94,30 +402,34 @@ async fn main() -> Result<()> {
         None
     };
 
-    let oneshot_query = if cli_args.is_empty() && piped_input.is_none() {
+    // ── Build query from positional args + piped input ──
+    let oneshot_query = if cli.query.is_empty() && piped_input.is_none() {
         None
     } else {
-        let query_part = cli_args.join(" ");
+        let query_part = cli.query.join(" ");
         let full_query = match (&piped_input, query_part.is_empty()) {
             (Some(piped), false) => {
                 format!("Given this input:\n```\n{}\n```\n\n{}", piped, query_part)
             }
             (Some(piped), true) => format!("Process this input:\n```\n{}\n```", piped),
             (None, false) => query_part,
-            (None, true) => return Ok(()), // shouldn't happen, but guard
+            (None, true) => return Ok(()),
         };
         Some(full_query)
     };
 
+    // ── --json warning for REPL mode ──
+    if cli.json && oneshot_query.is_none() {
+        eprintln!("Warning: --json is only supported in one-shot mode. Ignoring.");
+    }
+
     // ── Initialize structured logging ──
-    // In one-shot mode, suppress tracing to stderr so only the result shows
     if oneshot_query.is_none() {
         tracing_subscriber::fmt()
             .with_target(false)
             .with_level(false)
             .init();
     } else {
-        // Quiet logging for one-shot
         tracing_subscriber::fmt()
             .with_target(false)
             .with_level(false)
@@ -125,84 +437,50 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    info!("Starting Dig v0.1.0");
+    info!("Starting Dig v{}", VERSION);
 
     // ── Load configuration ──
-    let app_config = config::load_config()?;
+    let app_config = config::load_config(cli.config.as_deref())?;
 
-    // ── Load tool manifest ──
-    let tools = config::load_tools()?;
+    // ── Validate --model if provided ──
+    let model_override = cli.model.as_deref();
+    let used_model_override = model_override.is_some();
+    let config_default_model = app_config.default_model.clone();
 
-    // ── Create infrastructure ──
-    let cancel_token = CancellationToken::new();
-    let process_sandbox = Arc::new(ProcessSandbox::new(
-        app_config.max_concurrent_processes,
-        app_config.global_timeout_secs,
-    ));
+    let effective_model_override = match model_override {
+        Some(m) if !validate_model_format(m) => {
+            eprintln!(
+                "Warning: Invalid model format '{}'. Falling back to: {}",
+                m, config_default_model
+            );
+            None
+        }
+        other => other,
+    };
 
-    let token_counter = Arc::new(TokenCounter::new("cl100k_base"));
-    let governor = TokenGovernor::new(app_config.tokens_per_minute, app_config.token_budget)?;
-    let enforcer = BudgetEnforcer::new(app_config.max_ttl, app_config.max_turns_per_agent);
+    // ── Build permitter ──
+    let permitter: Arc<dyn ToolPermitter> = Arc::new(CliPermitter {
+        auto_approve: cli.yes,
+        safe_only: cli.safe_only,
+    });
 
-    // Initialize Provider config
-    let openai_cfg = app_config
-        .providers
-        .iter()
-        .find(|p| p.name == "openai")
-        .cloned()
-        .unwrap_or_else(|| agent_core::models::ProviderConfig {
-            name: "openai".into(),
-            api_base: "https://api.openai.com/v1".into(),
-            api_key_env: Some("OPENAI_API_KEY".into()),
-            model: app_config.default_model.clone(),
-        });
-    let api_key = std::env::var(
-        openai_cfg
-            .api_key_env
-            .as_deref()
-            .unwrap_or("OPENAI_API_KEY"),
+    // ── Build pipeline ──
+    let _tools_dir = cli.config.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    let mut pipeline = build_pipeline(
+        &app_config,
+        effective_model_override,
+        permitter.clone(),
+        cli.dry_run,
+        cli.no_cache,
+        cli.no_memory,
     )
-    .unwrap_or_else(|_| "dummy_key".into());
+    .await?;
 
-    // Initialize Memory (needs embedder + summarizer)
-    let embedder = Arc::new(OpenAiEmbeddings::new(
-        api_key.clone(),
-        openai_cfg.api_base.clone(),
-        "text-embedding-3-small".into(),
-    )?);
-
-    let provider: Arc<dyn agent_core::traits::LlmProvider> = Arc::new(OpenAiProvider::new(
-        openai_cfg.name,
-        api_key,
-        openai_cfg.api_base,
-        openai_cfg.model,
-    )?);
-
-    let memory = Arc::new(
-        HybridMemory::new(
-            "./lance_history",
-            token_counter.clone(),
-            8000,
-            embedder,
-            provider.clone(),
-        )
-        .await?,
-    );
-
-    let permitter = Arc::new(CliPermitter);
-
-    let mut agent_loop = AgentLoop::new(
-        provider,
-        memory,
-        process_sandbox,
-        governor.clone(),
-        enforcer,
-        permitter,
-        tools.clone(),
-    );
-    agent_loop.set_io_context(pipe_position.clone(), interactive, tty_available);
+    pipeline.agent_loop.set_io_context(pipe_position.clone(), interactive, tty_available);
 
     // ── Register SIGINT handler ──
+    let cancel_token = CancellationToken::new();
     let cancel_clone = cancel_token.clone();
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
@@ -214,56 +492,82 @@ async fn main() -> Result<()> {
     //  ONE-SHOT MODE: `dig <query>`
     // ══════════════════════════════════════════════════════════
     if let Some(query) = oneshot_query {
-        let session_id = Uuid::new_v4().to_string();
         let dig_debug = std::env::var("DIG_DEBUG").is_ok();
 
-        let envelope = MessageEnvelope {
-            proto_version: "1.1".to_string(),
-            msg_id: Uuid::new_v4().to_string(),
-            session_id: session_id.clone(),
-            parent_id: None,
-            timestamp: Utc::now(),
-            direction: Direction::ExecToBrain,
-            priority: Priority::Normal,
-            tags: vec![],
-            payload: ExecutorPayload::Query(agent_core::protocol::QueryPayload {
-                intent: Intent::Freeform,
-                context: agent_core::protocol::harvest_context(
-                    pipe_position.clone(),
-                    interactive,
-                    tty_available,
-                ),
-                query: query.clone(),
-                attachments: vec![],
-                constraints: Constraints {
-                    read_only: false,
-                    no_reboot: true,
-                    no_service_restart: vec![],
-                    max_downtime: "0s".into(),
-                    approved_scope: vec![],
-                    forbidden: vec![],
-                },
-                history_refs: vec![],
-            }),
-        };
+        let envelope = build_envelope(&query, &pipe_position, interactive, tty_available, cli.read_only);
 
         if dig_debug {
             eprintln!("[DIG_DEBUG] One-shot query: {}", query);
         }
 
-        let mut result = agent_loop.run_turn(&envelope, &cancel_token).await;
+        let mut result = pipeline.agent_loop.run_turn(&envelope, &cancel_token).await;
+
+        // Model fallback: if --model was used and API rejected it, rebuild with config default
+        if let Err(ref e) = result {
+            if used_model_override && is_model_error(e) {
+                eprintln!(
+                    "Warning: Model '{}' rejected by API. Falling back to '{}'.",
+                    cli.model.as_deref().unwrap_or("?"),
+                    config_default_model
+                );
+                pipeline = build_pipeline(
+                    &app_config,
+                    None,
+                    permitter.clone(),
+                    cli.dry_run,
+                    cli.no_cache,
+                    cli.no_memory,
+                )
+                .await?;
+                pipeline.agent_loop.set_io_context(pipe_position.clone(), interactive, tty_available);
+                let retry_envelope = build_envelope(&query, &pipe_position, interactive, tty_available, cli.read_only);
+                result = pipeline.agent_loop.run_turn(&retry_envelope, &cancel_token).await;
+            }
+        }
+
         let mut clarification_turns = 0;
 
         loop {
             match result {
                 Ok(AgentLoopResult::Completed(summary)) => {
-                    println!("{}", summary);
+                    if cli.json {
+                        let out = JsonSuccess { success: true, result: summary };
+                        println!("{}", serde_json::to_string(&out)?);
+                    } else {
+                        println!("{}", summary);
+                    }
+                    break;
+                }
+                Ok(AgentLoopResult::DryRun(commands)) => {
+                    if cli.json {
+                        let out = JsonDryRun {
+                            success: true,
+                            dry_run: true,
+                            commands: commands.iter().map(|c| JsonDryRunCommand {
+                                command: c.command.clone(),
+                                purpose: c.purpose.clone(),
+                                run_as: c.run_as.clone(),
+                                destructive: c.destructive,
+                            }).collect(),
+                        };
+                        println!("{}", serde_json::to_string(&out)?);
+                    } else {
+                        print!("{}", format_dry_run(&commands));
+                    }
                     break;
                 }
                 Ok(AgentLoopResult::NeedsHuman(clarification)) => {
                     clarification_turns += 1;
                     if clarification_turns >= 5 {
-                        eprintln!("Error: Exceeded maximum clarification turns (5).");
+                        if cli.json {
+                            let out = JsonError {
+                                success: false,
+                                error: "Exceeded maximum clarification turns (5)".into(),
+                            };
+                            println!("{}", serde_json::to_string(&out)?);
+                        } else {
+                            eprintln!("Error: Exceeded maximum clarification turns (5).");
+                        }
                         std::process::exit(1);
                     }
 
@@ -302,7 +606,8 @@ async fn main() -> Result<()> {
                         }
                         let answer = all_defaults.join(" ");
                         eprintln!("[dig] auto-answering: {} (no tty)", answer);
-                        result = agent_loop
+                        result = pipeline
+                            .agent_loop
                             .submit_clarification_answer(&answer, &cancel_token)
                             .await;
                         continue;
@@ -354,12 +659,21 @@ async fn main() -> Result<()> {
                         break;
                     }
 
-                    result = agent_loop
+                    result = pipeline
+                        .agent_loop
                         .submit_clarification_answer(trimmed_ans, &cancel_token)
                         .await;
                 }
                 Err(e) => {
-                    println!("Error: {}", e);
+                    if cli.json {
+                        let out = JsonError {
+                            success: false,
+                            error: e.to_string(),
+                        };
+                        println!("{}", serde_json::to_string(&out)?);
+                    } else {
+                        println!("Error: {}", e);
+                    }
                     std::process::exit(1);
                 }
             }
@@ -370,7 +684,10 @@ async fn main() -> Result<()> {
     // ══════════════════════════════════════════════════════════
     //  REPL MODE: `dig` (no args)
     // ══════════════════════════════════════════════════════════
-    println!("\n🤖 dig v0.1.0 — Type 'exit' to quit, 'help' for commands\n");
+    println!(
+        "\n🤖 dig v{} — Type 'exit' to quit, 'help' for commands\n",
+        VERSION
+    );
 
     loop {
         if cancel_token.is_cancelled() {
@@ -401,7 +718,7 @@ async fn main() -> Result<()> {
             }
             "tools" => {
                 println!("\n📦 Available tools:");
-                for tool in &tools {
+                for tool in &pipeline.tools {
                     println!("  • {} [{}] — {}", tool.name, tool.tier, tool.description);
                 }
                 println!();
@@ -410,58 +727,33 @@ async fn main() -> Result<()> {
             "budget" => {
                 println!(
                     "  Token budget: {} used / {} remaining / {} total",
-                    governor.total_used(),
-                    governor.remaining(),
-                    app_config.token_budget
+                    pipeline.governor.total_used(),
+                    pipeline.governor.remaining(),
+                    pipeline.token_budget
                 );
                 continue;
             }
             _ => {}
         }
 
-        let session_id = Uuid::new_v4().to_string();
         let dig_debug = std::env::var("DIG_DEBUG").is_ok();
 
-        let envelope = MessageEnvelope {
-            proto_version: "1.1".to_string(),
-            msg_id: Uuid::new_v4().to_string(),
-            session_id: session_id.clone(),
-            parent_id: None,
-            timestamp: Utc::now(),
-            direction: Direction::ExecToBrain,
-            priority: Priority::Normal,
-            tags: vec![],
-            payload: ExecutorPayload::Query(agent_core::protocol::QueryPayload {
-                intent: Intent::Freeform,
-                context: agent_core::protocol::harvest_context(
-                    pipe_position.clone(),
-                    interactive,
-                    tty_available,
-                ),
-                query: trimmed.clone(),
-                attachments: vec![],
-                constraints: Constraints {
-                    read_only: false,
-                    no_reboot: true,
-                    no_service_restart: vec![],
-                    max_downtime: "0s".into(),
-                    approved_scope: vec![],
-                    forbidden: vec![],
-                },
-                history_refs: vec![],
-            }),
-        };
+        let envelope = build_envelope(&trimmed, &pipe_position, interactive, tty_available, cli.read_only);
 
         if dig_debug {
             eprintln!("[DIG_DEBUG] REPL query: {}", trimmed);
         }
 
-        let mut result = agent_loop.run_turn(&envelope, &cancel_token).await;
+        let mut result = pipeline.agent_loop.run_turn(&envelope, &cancel_token).await;
 
         loop {
             match result {
                 Ok(AgentLoopResult::Completed(summary)) => {
                     println!("\n🤖 {}", summary);
+                    break;
+                }
+                Ok(AgentLoopResult::DryRun(commands)) => {
+                    print!("\n{}", format_dry_run(&commands));
                     break;
                 }
                 Ok(AgentLoopResult::NeedsHuman(clarification)) => {
@@ -497,7 +789,8 @@ async fn main() -> Result<()> {
                         }
                         let answer = all_defaults.join(" ");
                         eprintln!("[dig] auto-answering: {} (no tty)", answer);
-                        result = agent_loop
+                        result = pipeline
+                            .agent_loop
                             .submit_clarification_answer(&answer, &cancel_token)
                             .await;
                         continue;
@@ -546,13 +839,14 @@ async fn main() -> Result<()> {
                         break;
                     }
 
-                    result = agent_loop
+                    result = pipeline
+                        .agent_loop
                         .submit_clarification_answer(trimmed_ans, &cancel_token)
                         .await;
                 }
                 Err(e) => {
                     println!("  ✗ Error: {}", e);
-                    agent_loop.reset();
+                    pipeline.agent_loop.reset();
                     break;
                 }
             }
@@ -567,8 +861,22 @@ fn print_help() {
     println!(
         r#"
   Usage:
-    dig <query>      — One-shot: ask a question, get the answer, exit
-    dig              — Interactive REPL mode
+    dig [OPTIONS] <query>  — One-shot: ask a question, get the answer, exit
+    dig [OPTIONS]          — Interactive REPL mode
+
+  Options:
+    -d, --debug            Enable debug traces (LLM request/response)
+        --dry-run          Show generated commands without executing
+    -m, --model <MODEL>    Override LLM model for this invocation
+    -y, --yes              Auto-approve all security prompts (DANGEROUS)
+        --json             Output as structured JSON (one-shot only)
+    -c, --config <PATH>    Path to config file
+        --read-only        Restrict to read-only commands
+        --safe-only        Only allow Safe-tier commands
+        --no-cache         Skip command cache, force LLM call
+        --no-memory        Disable semantic history
+    -h, --help             Print help
+    -V, --version          Print version
 
   REPL Commands:
     exit, quit       — Shut down

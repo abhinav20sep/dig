@@ -47,7 +47,7 @@ mod tests {
 
     mod models_tests {
         use crate::models::{AgentAction, AgentMessage};
-        use serde_json::{self, Value};
+        use serde_json;
 
         #[test]
         fn test_agent_message_serde_roundtrip() {

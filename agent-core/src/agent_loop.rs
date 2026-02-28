@@ -18,8 +18,18 @@ pub trait ToolPermitter: Send + Sync {
     async fn check_permission(&self, command: &str, args: &[String]) -> Result<bool>;
 }
 
+/// A command captured during dry-run mode (not executed).
+#[derive(Debug, Clone)]
+pub struct DryRunCommand {
+    pub command: String,
+    pub purpose: String,
+    pub run_as: String,
+    pub destructive: bool,
+}
+
 pub enum AgentLoopResult {
     Completed(String),
+    DryRun(Vec<DryRunCommand>),
     NeedsHuman(crate::protocol::BrainClarificationPayload),
 }
 
@@ -40,6 +50,11 @@ pub struct AgentLoop {
     pub pipe_position: String,
     pub interactive: bool,
     pub tty_available: bool,
+
+    // CLI flag overrides
+    pub dry_run: bool,
+    pub no_cache: bool,
+    pub no_memory: bool,
 }
 
 impl AgentLoop {
@@ -156,6 +171,9 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
             pipe_position: "none".to_string(),
             interactive: true,
             tty_available: true,
+            dry_run: false,
+            no_cache: false,
+            no_memory: false,
         }
     }
 
@@ -218,7 +236,11 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
             .unwrap_or_else(|_| "Error serializing payload".into());
 
         if self.chat_history.is_empty() {
-            let context_block = self.memory.get_context_block(&user_query).await?;
+            let context_block = if self.no_memory {
+                String::new()
+            } else {
+                self.memory.get_context_block(&user_query).await?
+            };
             self.chat_history.push(ChatMessage {
                 role: Role::System,
                 content: format!("{}\n\n[CONTEXT]\n{}", self.system_prompt, context_block),
@@ -266,7 +288,7 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
             }
 
             // 3. Check Command Cache (Jaccard text similarity — no embedding API calls)
-            if self.current_turn_count == 0 {
+            if self.current_turn_count == 0 && !self.no_cache && !self.no_memory {
                 if let Ok(Some(cached_response)) =
                     self.memory.find_cached_command(&user_query).await
                 {
@@ -346,7 +368,9 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                         .map(|m| &m.content)
                         .cloned()
                         .unwrap_or_default();
-                    self.memory.record_turn(&original_user, &summary).await?;
+                    if !self.no_memory {
+                        self.memory.record_turn(&original_user, &summary).await?;
+                    }
                     self.reset();
                     return Ok(AgentLoopResult::Completed(summary));
                 }
@@ -376,6 +400,17 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                     parameters,
                 } => {
                     info!(tool = %tool_name, params = %parameters, "Direct RunAndReturn Tool Execution");
+
+                    if self.dry_run {
+                        let cmd = format!("{} {}", tool_name, parameters);
+                        self.reset();
+                        return Ok(AgentLoopResult::DryRun(vec![DryRunCommand {
+                            command: cmd,
+                            purpose: "RunAndReturn tool execution".into(),
+                            run_as: "user".into(),
+                            destructive: false,
+                        }]));
+                    }
 
                     let tool_def = self.tools.iter().find(|t| t.name == tool_name);
                     let result_str = match tool_def {
@@ -439,7 +474,9 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                             .map(|m| &m.content)
                                             .cloned()
                                             .unwrap_or_default();
-                                        let _ = self.memory.record_turn(&original_user, &out).await;
+                                        if !self.no_memory {
+                                            let _ = self.memory.record_turn(&original_user, &out).await;
+                                        }
                                         self.reset();
                                         return Ok(AgentLoopResult::Completed(out));
                                     }
@@ -458,6 +495,17 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                     parameters,
                 } => {
                     info!(tool = %tool_name, params = %parameters, "Executing Tool");
+
+                    if self.dry_run {
+                        let cmd = format!("{} {}", tool_name, parameters);
+                        self.reset();
+                        return Ok(AgentLoopResult::DryRun(vec![DryRunCommand {
+                            command: cmd,
+                            purpose: "ExecuteTool invocation".into(),
+                            run_as: "user".into(),
+                            destructive: false,
+                        }]));
+                    }
 
                     // Verify tool exists in manifest
                     let tool_def = self.tools.iter().find(|t| t.name == tool_name);
@@ -542,11 +590,26 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                         BrainPayload::Response(resp) => {
                             // Return terminal responses (answer, error, analysis) directly to user
                             if resp.actions.is_empty() {
-                                // Cache the answer for future Jaccard matching
-                                let _ = self.memory.cache_command(&user_query, &resp.content).await;
-                                self.memory.record_turn(&user_query, &resp.content).await?;
+                                if !self.no_memory {
+                                    let _ = self.memory.cache_command(&user_query, &resp.content).await;
+                                    self.memory.record_turn(&user_query, &resp.content).await?;
+                                }
                                 self.reset();
                                 return Ok(AgentLoopResult::Completed(resp.content));
+                            }
+
+                            // Dry-run: capture commands without executing
+                            if self.dry_run {
+                                let commands: Vec<DryRunCommand> = resp.actions.iter().map(|a| {
+                                    DryRunCommand {
+                                        command: a.command.clone(),
+                                        purpose: a.purpose.clone(),
+                                        run_as: a.run_as.clone(),
+                                        destructive: a.destructive,
+                                    }
+                                }).collect();
+                                self.reset();
+                                return Ok(AgentLoopResult::DryRun(commands));
                             }
 
                             let mut cumulative_output = String::new();

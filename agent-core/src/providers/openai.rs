@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use anyhow::{Result, Context, bail};
 use reqwest::{Client, header};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 use uuid::Uuid;

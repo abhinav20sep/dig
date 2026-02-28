@@ -45,26 +45,47 @@ fn find_config_file(filename: &str) -> Option<PathBuf> {
 }
 
 /// Load the application configuration.
-pub fn load_config() -> Result<AppConfig> {
-    match find_config_file("config.toml") {
-        Some(path) => {
-            tracing::info!("Loading config from {}", path.display());
-            let contents = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            let config: AppConfig = toml::from_str(&contents)
-                .with_context(|| format!("Failed to parse {}", path.display()))?;
-            Ok(config)
+/// If `override_path` is provided, use that file directly instead of searching.
+pub fn load_config(override_path: Option<&Path>) -> Result<AppConfig> {
+    let path = match override_path {
+        Some(p) => {
+            anyhow::ensure!(p.exists(), "Config file not found: {}", p.display());
+            p.to_path_buf()
         }
-        None => {
-            tracing::warn!("config.toml not found — using default configuration");
-            Ok(AppConfig::default())
-        }
-    }
+        None => match find_config_file("config.toml") {
+            Some(p) => p,
+            None => {
+                tracing::warn!("config.toml not found — using default configuration");
+                return Ok(AppConfig::default());
+            }
+        },
+    };
+
+    tracing::info!("Loading config from {}", path.display());
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let config: AppConfig = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    Ok(config)
 }
 
 /// Load the tool manifest.
-pub fn load_tools() -> Result<Vec<ToolManifestEntry>> {
-    match find_config_file("tools.toml") {
+/// If `config_dir` is provided, look for tools.toml in that directory.
+pub fn load_tools(config_dir: Option<&Path>) -> Result<Vec<ToolManifestEntry>> {
+    let path = match config_dir {
+        Some(dir) => {
+            let tools_path = dir.join("tools.toml");
+            if tools_path.exists() {
+                Some(tools_path)
+            } else {
+                // Fall back to default search if tools.toml not in the override dir
+                find_config_file("tools.toml")
+            }
+        }
+        None => find_config_file("tools.toml"),
+    };
+
+    match path {
         Some(path) => {
             tracing::info!("Loading tools from {}", path.display());
             let contents = std::fs::read_to_string(&path)

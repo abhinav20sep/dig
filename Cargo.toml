@@ -9,6 +9,7 @@ members = ["agent-core"]
 [dependencies]
 agent-core = { path = "agent-core" }
 anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }
 async-trait = "0.1.89"
 chrono = "0.4.43"
 dialoguer = "0.12.0"
