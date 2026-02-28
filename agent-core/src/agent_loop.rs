@@ -6,9 +6,9 @@ use uuid::Uuid;
 
 use crate::governor::{BudgetEnforcer, TokenGovernor};
 use crate::memory::HybridMemory;
-use crate::models::{AgentAction, AgentMessage, ChatMessage, Role, ToolManifestEntry};
-use crate::protocol::{Direction, ExecutorPayload, MessageEnvelope, Priority};
-use crate::sandbox::ProcessSandbox;
+use crate::models::{AgentAction, ChatMessage, Role, ToolManifestEntry};
+use crate::protocol::{ExecutorPayload, MessageEnvelope};
+use crate::sandbox::{ProcessSandbox, truncate_output};
 use crate::traits::LlmProvider;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -412,8 +412,9 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                 {
                                     Ok(res) => {
                                         let mut out = String::new();
-                                        if !res.stdout.trim().is_empty() {
-                                            out.push_str(res.stdout.trim());
+                                        let truncated_stdout = truncate_output(&res.stdout);
+                                        if !truncated_stdout.trim().is_empty() {
+                                            out.push_str(truncated_stdout.trim());
                                         }
                                         if !res.stderr.trim().is_empty() {
                                             if !out.is_empty() {
@@ -431,11 +432,6 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                                 "\nNote: Command exited with failure status ({}).",
                                                 res.exit_code
                                             ));
-                                        } else if tool_name == "bash" {
-                                            if let Some(serde_json::Value::String(bash_cmd)) =
-                                                parameters.get("cmd")
-                                            {
-                                            }
                                         }
                                         let original_user = self
                                             .chat_history
@@ -500,11 +496,19 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                 {
                                     Ok(res) => {
                                         let mut out = String::new();
-                                        if !res.stdout.trim().is_empty() {
-                                            out.push_str(&format!("STDOUT:\n{}\n", res.stdout));
+                                        let truncated_stdout = truncate_output(&res.stdout);
+                                        let truncated_stderr = truncate_output(&res.stderr);
+                                        if !truncated_stdout.trim().is_empty() {
+                                            out.push_str(&format!(
+                                                "STDOUT:\n{}\n",
+                                                truncated_stdout
+                                            ));
                                         }
-                                        if !res.stderr.trim().is_empty() {
-                                            out.push_str(&format!("STDERR:\n{}\n", res.stderr));
+                                        if !truncated_stderr.trim().is_empty() {
+                                            out.push_str(&format!(
+                                                "STDERR:\n{}\n",
+                                                truncated_stderr
+                                            ));
                                         }
                                         if out.is_empty() {
                                             out.push_str(
@@ -516,11 +520,6 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                                 "\nNote: Command exited with failure status ({}).",
                                                 res.exit_code
                                             ));
-                                        } else if tool_name == "bash" {
-                                            if let Some(serde_json::Value::String(bash_cmd)) =
-                                                parameters.get("cmd")
-                                            {
-                                            }
                                         }
                                         out
                                     }
@@ -597,16 +596,44 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                     continue;
                                 }
 
-                                match self
-                                    .sandbox
-                                    .execute(
-                                        "bash",
-                                        &["-c", &action.command],
-                                        action.timeout_s,
-                                        &action.on_timeout,
-                                    )
-                                    .await
+                                // Respect run_as field: prepend sudo if needed
+                                let effective_command = if action.run_as == "root"
+                                    && std::env::var("USER").unwrap_or_default() != "root"
                                 {
+                                    format!("sudo {}", action.command)
+                                } else {
+                                    action.command.clone()
+                                };
+
+                                // Choose streaming vs sync execution
+                                let exec_result = if matches!(
+                                    action.exec_mode,
+                                    crate::protocol::ExecMode::Streaming
+                                ) {
+                                    // Stream output line-by-line to user's terminal
+                                    self.sandbox
+                                        .execute_streaming(
+                                            "bash",
+                                            &["-c", &effective_command],
+                                            action.timeout_s,
+                                            &action.on_timeout,
+                                            |line| {
+                                                eprintln!("{}", line);
+                                            },
+                                        )
+                                        .await
+                                } else {
+                                    self.sandbox
+                                        .execute(
+                                            "bash",
+                                            &["-c", &effective_command],
+                                            action.timeout_s,
+                                            &action.on_timeout,
+                                        )
+                                        .await
+                                };
+
+                                match exec_result {
                                     Ok(res) => {
                                         if action.expect_context_push
                                             || matches!(
@@ -677,8 +704,8 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                             }
                                         } else {
                                             crate::protocol::OutputContent::Direct {
-                                                stdout: res.stdout.clone(),
-                                                stderr: res.stderr.clone(),
+                                                stdout: truncate_output(&res.stdout),
+                                                stderr: truncate_output(&res.stderr),
                                             }
                                         };
 

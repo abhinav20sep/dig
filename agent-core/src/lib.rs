@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod providers;
 pub mod sandbox;
 pub mod sanitizer;
+pub mod shell_session;
 #[cfg(test)]
 mod tests;
 pub mod traits;

@@ -7,7 +7,7 @@ max_turns_per_agent = 10
 token_budget = 500000
 tokens_per_minute = 90000
 max_concurrent_processes = 50
-global_timeout_secs = 120
+global_timeout_secs = 300
 
 [[providers]]
 name = "openai"

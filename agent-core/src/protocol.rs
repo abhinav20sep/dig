@@ -1,7 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use uuid::Uuid;
 
 /// Base Envelope (ALL messages)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +88,8 @@ pub struct ExecutorContext {
     pub tty_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +439,10 @@ pub fn harvest_context(
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
 
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
     ExecutorContext {
         hostname,
         distro,
@@ -452,5 +456,6 @@ pub fn harvest_context(
         interactive,
         tty_available,
         notes: None,
+        cwd,
     }
 }

@@ -113,11 +113,52 @@ mod tests {
         }
 
         #[test]
-        fn test_unknown_defaults_to_safe() {
+        fn test_unknown_defaults_to_confirm() {
+            // Unknown commands default to Confirm for safety (not Safe)
             assert!(matches!(
                 classify_command("my_custom_tool"),
+                SecurityTier::Confirm
+            ));
+        }
+
+        #[test]
+        fn test_hacking_tools_sandbox() {
+            assert!(matches!(classify_command("nmap"), SecurityTier::Sandbox));
+            assert!(matches!(classify_command("tcpdump"), SecurityTier::Sandbox));
+            assert!(matches!(classify_command("strace"), SecurityTier::Sandbox));
+            assert!(matches!(classify_command("gdb"), SecurityTier::Sandbox));
+            assert!(matches!(classify_command("nc"), SecurityTier::Sandbox));
+            assert!(matches!(
+                classify_command("modprobe"),
+                SecurityTier::Sandbox
+            ));
+            assert!(matches!(
+                classify_command("iptables"),
+                SecurityTier::Sandbox
+            ));
+        }
+
+        #[test]
+        fn test_bash_inner_command_classification() {
+            // bash -c with a destructive inner command should be Sandbox
+            assert!(matches!(
+                classify_command("bash -c \"rm -rf /tmp/foo\""),
+                SecurityTier::Sandbox
+            ));
+            // bash -c with a safe inner command should be Safe
+            assert!(matches!(
+                classify_command("bash -c \"ls -la\""),
                 SecurityTier::Safe
             ));
+        }
+
+        #[test]
+        fn test_binary_analysis_tools_safe() {
+            assert!(matches!(classify_command("readelf"), SecurityTier::Safe));
+            assert!(matches!(classify_command("objdump"), SecurityTier::Safe));
+            assert!(matches!(classify_command("strings"), SecurityTier::Safe));
+            assert!(matches!(classify_command("hexdump"), SecurityTier::Safe));
+            assert!(matches!(classify_command("nm"), SecurityTier::Safe));
         }
     }
 }
