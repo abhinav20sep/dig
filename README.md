@@ -110,11 +110,18 @@ dlroW olleH
 
 - **Dual Mode** — `dig <query>` for one-shot, `dig` for interactive REPL
 - **Stdin Pipe** — `cat file.txt | dig summarize this`
-- **Security Tiers** — Safe commands auto-execute, destructive ones require confirmation
-- **Jaccard Command Cache** — Repeated queries bypass the LLM entirely (token-level text matching, no API calls)
+- **Security Tiers** — 80+ classified commands across Safe/Confirm/Sandbox tiers; unknown commands default to **Confirm**
+- **`bash -c` Inner Parsing** — `bash -c "rm -rf /"` is correctly classified as **Sandbox**, not Safe
+- **Jaccard Command Cache** — Repeated queries bypass the LLM entirely (no API calls)
 - **30-Turn Context Memory** — Remembers your last 30 queries for conversational continuity  
 - **Semantic History** — LanceDB vector search for relevant past interactions
 - **Token Governor** — Hard budget limits prevent runaway API costs
+- **Output Truncation** — Large outputs (e.g. `find /`, `dmesg`) are capped at 200 lines / 32KB before feeding to the LLM; head+tail sampling preserves context
+- **Binary Data Safety** — Non-UTF8 output (hex dumps, raw binary) is auto-converted to a hex preview, preventing UTF-8 decode errors
+- **`run_as: root` / sudo** — LLM can request privilege escalation; `dig` auto-prepends `sudo` when needed
+- **CWD Tracking** — Current working directory is included in every executor context for accurate relative-path commands
+- **Streaming Execution** — `ExecMode: Streaming` prints output line-by-line in real-time
+- **Persistent Shell Session** — `shell_session.rs` spawns a single `bash` process; `cd`, `export`, and aliases persist across commands
 - **DIG_DEBUG** — Set `DIG_DEBUG=1` to see full LLM request/response traces
 
 ---
@@ -187,19 +194,20 @@ DIG_DEBUG=1 dig what is my ip
 
 | Tier | Behavior | Examples |
 |------|----------|---------|
-| **Safe** | Auto-executes | `ls`, `cat`, `grep`, `find`, `ps`, `df`, `uname` |
-| **Confirm** | Prompts before executing | `git`, `docker`, `curl`, `wget`, `mv`, `cp`, `apt`, `systemctl` |
-| **Sandbox** | Requires explicit approval | `rm`, `dd`, `sudo`, `chmod`, `chown`, `kill`, `reboot` |
+| **Safe** | Auto-executes | `ls`, `cat`, `grep`, `find`, `ps`, `df`, `uname`, `readelf`, `objdump`, `strings`, `hexdump`, `nm`, `bash`, `sh` |
+| **Confirm** | Prompts before executing | `git`, `docker`, `curl`, `wget`, `mv`, `cp`, `apt`, `systemctl`, `python`, `dmesg`, `journalctl`, `ssh`, `ping`, `ip` |
+| **Sandbox** | Requires explicit approval | `rm`, `dd`, `sudo`, `chmod`, `chown`, `kill`, `reboot`, `nmap`, `tcpdump`, `strace`, `gdb`, `nc`, `modprobe`, `iptables`, `hashcat` |
+| **Unknown** | Defaults to **Confirm** | Any command not in the above lists |
 
 ---
 
 ## Testing
 
 ```bash
-# Unit tests (17 tests)
+# Unit tests (20 tests)
 cargo test -p agent-core
 
-# CLI integration tests (12 tests, 17 assertions)
+# CLI integration tests (25 tests, 31 assertions)
 ./test_cli.sh
 ```
 
@@ -216,7 +224,8 @@ dig/
 │   └── src/
 │       ├── agent_loop.rs    # Core LLM ↔ Executor loop
 │       ├── memory.rs        # Jaccard cache + LanceDB semantic memory
-│       ├── sandbox.rs       # Process execution + security tiers
+│       ├── sandbox.rs       # Process execution + security tiers (80+ tools)
+│       ├── shell_session.rs # Persistent bash shell session (stateful env)
 │       ├── protocol.rs      # JSON v1.1 message envelope schema
 │       ├── governor.rs      # Token budget + rate limiter
 │       ├── sanitizer.rs     # LLM output sanitization
