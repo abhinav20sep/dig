@@ -102,7 +102,7 @@ dlroW olleH
 | Sandbox | `agent-core/src/sandbox.rs` | Security tier classification (Safe/Confirm/Sandbox), process execution |
 | Protocol | `agent-core/src/protocol.rs` | JSON v1.1 MessageEnvelope schema, typed payloads |
 | Governor | `agent-core/src/governor.rs` | Token budget, turn limits, rate limiting |
-| LLM Provider | `agent-core/src/providers/openai.rs` | OpenAI-compatible API client with exponential backoff |
+| LLM Provider | `agent-core/src/providers/openai.rs` | OpenAI-compatible API client with exponential backoff and 4-step fallback parse cascade |
 
 ---
 
@@ -122,6 +122,7 @@ dlroW olleH
 - **CWD Tracking** — Current working directory is included in every executor context for accurate relative-path commands
 - **Streaming Execution** — `ExecMode: Streaming` prints output line-by-line in real-time
 - **Persistent Shell Session** — `shell_session.rs` spawns a single `bash` process; `cd`, `export`, and aliases persist across commands
+- **LLM Response Fallback** — 4-step parse cascade recovers from malformed LLM responses (bare payloads, unwrapped actions, missing envelope fields) instead of failing with a parse error
 - **DIG_DEBUG** — Set `DIG_DEBUG=1` to see full LLM request/response traces
 
 ---
@@ -204,7 +205,7 @@ DIG_DEBUG=1 dig what is my ip
 ## Testing
 
 ```bash
-# Unit tests (20 tests)
+# Unit tests (38 tests)
 cargo test -p agent-core
 
 # CLI integration tests (25 tests, 31 assertions)

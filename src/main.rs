@@ -14,6 +14,7 @@ use tracing::info;
 use agent_core::agent_loop::{AgentLoop, AgentLoopResult, DryRunCommand, ToolPermitter};
 use agent_core::governor::{BudgetEnforcer, TokenCounter, TokenGovernor};
 use agent_core::memory::HybridMemory;
+use agent_core::plugin::PluginManager;
 use agent_core::protocol::*;
 use agent_core::providers::embeddings::OpenAiEmbeddings;
 use agent_core::providers::openai::OpenAiProvider;
@@ -80,6 +81,10 @@ struct Cli {
     /// Disable LanceDB semantic history for this session.
     #[arg(long)]
     no_memory: bool,
+
+    /// Plugin management: list, enable <name>, disable <name>, install <path>.
+    #[arg(long, value_name = "ACTION", num_args = 1..=2)]
+    plugin: Vec<String>,
 
     /// Natural language query. Everything not a recognized flag becomes
     /// part of the query. Use `--` to pass flag-like words as query text.
@@ -176,6 +181,7 @@ impl ToolPermitter for CliPermitter {
         }
         Ok(proceed)
     }
+
 }
 
 // ── Model Validation ────────────────────────────────────────────
@@ -211,6 +217,7 @@ async fn build_pipeline(
     dry_run: bool,
     no_cache: bool,
     no_memory: bool,
+    plugin_manager: Option<PluginManager>,
 ) -> Result<Pipeline> {
     let mut openai_cfg = app_config
         .providers
@@ -283,6 +290,7 @@ async fn build_pipeline(
         enforcer,
         permitter,
         tools.clone(),
+        plugin_manager,
     );
     agent_loop.dry_run = dry_run;
     agent_loop.no_cache = no_cache;
@@ -371,6 +379,77 @@ async fn main() -> Result<()> {
         unsafe { std::env::set_var("DIG_DEBUG", "1"); }
     }
 
+    // ── Handle --plugin actions (early exit, before any I/O) ──
+    if !cli.plugin.is_empty() {
+        let plugin_manager = config::plugins_dir().and_then(|dir| PluginManager::load(&dir));
+        let action = cli.plugin[0].as_str();
+        match action {
+            "list" => {
+                match plugin_manager {
+                    Some(pm) => pm.print_list(),
+                    None => println!("No plugins directory found. Create ~/.config/dig/plugins/ with a plugins.toml to get started."),
+                }
+                return Ok(());
+            }
+            "enable" => {
+                let name = cli.plugin.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+                    eprintln!("Usage: dig --plugin enable <name>");
+                    std::process::exit(1);
+                });
+                match plugin_manager {
+                    Some(mut pm) => {
+                        pm.enable(name)?;
+                        println!("Plugin '{}' enabled.", name);
+                    }
+                    None => eprintln!("No plugins directory found."),
+                }
+                return Ok(());
+            }
+            "disable" => {
+                let name = cli.plugin.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+                    eprintln!("Usage: dig --plugin disable <name>");
+                    std::process::exit(1);
+                });
+                match plugin_manager {
+                    Some(mut pm) => {
+                        pm.disable(name)?;
+                        println!("Plugin '{}' disabled.", name);
+                    }
+                    None => eprintln!("No plugins directory found."),
+                }
+                return Ok(());
+            }
+            "install" => {
+                let script_path = cli.plugin.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+                    eprintln!("Usage: dig --plugin install <script-path>");
+                    std::process::exit(1);
+                });
+                let plugins_dir = config::plugins_dir().unwrap_or_else(|| {
+                    // Create the directory if it doesn't exist
+                    let dir = dirs::home_dir()
+                        .expect("Cannot determine home directory")
+                        .join(".config")
+                        .join("dig")
+                        .join("plugins");
+                    std::fs::create_dir_all(&dir).expect("Failed to create plugins directory");
+                    dir
+                });
+                let mut pm = PluginManager::load(&plugins_dir).unwrap_or_else(|| {
+                    // Create empty manifest
+                    let manifest_path = plugins_dir.join("plugins.toml");
+                    std::fs::write(&manifest_path, "").expect("Failed to create plugins.toml");
+                    PluginManager::load(&plugins_dir).expect("Failed to initialize plugin manager")
+                });
+                pm.install(std::path::Path::new(script_path))?;
+                return Ok(());
+            }
+            other => {
+                eprintln!("Unknown plugin action: '{}'. Use: list, enable, disable, install", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // ── Determine pipe / TTY state ──
     let stdout_is_pipe = !std::io::stdout().is_terminal();
     let stdin_is_pipe = !std::io::stdin().is_terminal();
@@ -442,6 +521,9 @@ async fn main() -> Result<()> {
     // ── Load configuration ──
     let app_config = config::load_config(cli.config.as_deref())?;
 
+    // ── Load plugins ──
+    let plugin_manager = config::plugins_dir().and_then(|dir| PluginManager::load(&dir));
+
     // ── Validate --model if provided ──
     let model_override = cli.model.as_deref();
     let used_model_override = model_override.is_some();
@@ -474,6 +556,7 @@ async fn main() -> Result<()> {
         cli.dry_run,
         cli.no_cache,
         cli.no_memory,
+        plugin_manager,
     )
     .await?;
 
@@ -517,6 +600,7 @@ async fn main() -> Result<()> {
                     cli.dry_run,
                     cli.no_cache,
                     cli.no_memory,
+                    None, // plugins already consumed by first pipeline
                 )
                 .await?;
                 pipeline.agent_loop.set_io_context(pipe_position.clone(), interactive, tty_available);
@@ -875,6 +959,7 @@ fn print_help() {
         --safe-only        Only allow Safe-tier commands
         --no-cache         Skip command cache, force LLM call
         --no-memory        Disable semantic history
+        --plugin <ACTION>  Plugin management (list, enable, disable, install)
     -h, --help             Print help
     -V, --version          Print version
 

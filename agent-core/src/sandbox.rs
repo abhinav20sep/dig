@@ -309,7 +309,7 @@ pub struct CommandResult {
 fn binary_safe_string(buf: &[u8]) -> String {
     let is_binary = buf
         .iter()
-        .any(|&b| b == 0 || (b < 32 && b != b'\n' && b != b'\r' && b != b'\t'));
+        .any(|&b| b == 0 || (b < 32 && b != b'\n' && b != b'\r' && b != b'\t' && b != b'\x1b'));
     if is_binary {
         let preview_len = buf.len().min(512);
         let hex: String = buf[..preview_len]

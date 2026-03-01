@@ -3,6 +3,7 @@ pub mod governor;
 pub mod manager;
 pub mod memory;
 pub mod models;
+pub mod plugin;
 pub mod protocol;
 pub mod providers;
 pub mod sandbox;

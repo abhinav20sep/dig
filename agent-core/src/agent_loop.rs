@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::governor::{BudgetEnforcer, TokenGovernor};
 use crate::memory::HybridMemory;
 use crate::models::{AgentAction, ChatMessage, Role, ToolManifestEntry};
+use crate::plugin::PluginManager;
 use crate::protocol::{ExecutorPayload, MessageEnvelope};
 use crate::sandbox::{ProcessSandbox, truncate_output};
 use crate::traits::LlmProvider;
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 #[async_trait]
 pub trait ToolPermitter: Send + Sync {
     async fn check_permission(&self, command: &str, args: &[String]) -> Result<bool>;
+
 }
 
 /// A command captured during dry-run mode (not executed).
@@ -55,6 +57,11 @@ pub struct AgentLoop {
     pub dry_run: bool,
     pub no_cache: bool,
     pub no_memory: bool,
+
+    // Plugin system
+    plugin_manager: Option<PluginManager>,
+    /// The original user query (set per turn for plugin context)
+    current_query: String,
 }
 
 impl AgentLoop {
@@ -66,8 +73,9 @@ impl AgentLoop {
         enforcer: BudgetEnforcer,
         permitter: Arc<dyn ToolPermitter>,
         tools: Vec<ToolManifestEntry>,
+        plugin_manager: Option<PluginManager>,
     ) -> Self {
-        let system_prompt = r#"You are the Brain component of a SysAdmin LLM architecture.
+        let mut system_prompt = r#"You are the Brain component of a SysAdmin LLM architecture.
 You receive JSON `MessageEnvelope` requests from the user's terminal containing an `ExecutorPayload`.
 You MUST reply with a completely valid stringified JSON matching the v1.1 `MessageEnvelope<BrainPayload>` tagged-union schema.
 No markdown block ticks wrapping the JSON. No conversational preamble. Just JSON.
@@ -76,6 +84,13 @@ The envelope MUST have `proto_version`: "1.1".
 Your `payload` MUST contain a `"type"` discriminator ("response", "clarification", "fetch_chunk", "signal").
 
 CRITICAL INSTRUCTION: You are an agentic terminal executor. If the user's query implies performing an action, finding files, or manipulating the system, you MUST execute the bash commands for them using the `actions` array. DO NOT just verbally instruct the user how to do it. Only use `response_type: "answer"` without actions if the user is explicitly just asking a conceptual question.
+
+DISCOVERY-FIRST RULE — SOFTWARE TASKS: When the user's task involves installing, updating, upgrading, removing, or checking a named software tool or package (e.g. "update claude code", "install neovim", "upgrade node"), you MUST:
+1. NEVER ask for clarification about files or directories — these are software/product names, NOT file paths.
+2. STEP 1 — CHECK IF INSTALLED: Run `which <tool>` to see if it exists. Binary names often differ from package names (e.g. "claude-code" installs binary "claude", "neovim" installs "nvim", "golang" installs "go"), so try plausible variants: `which <tool> || which <short-name>`. If not found, tell the user and offer to install it. STOP HERE if not found.
+3. STEP 2 — LEARN THE TOOL: Run `<tool> --help` to read its capabilities. This tells you what subcommands exist (update, self-update, upgrade, etc.) and how the tool works. Do NOT guess — read the help output first.
+4. STEP 3 — ACT: Based on what --help told you, run the exact correct command. Use ONLY what the tool itself documented. NEVER shotgun-chain multiple package managers with `||` (e.g. NEVER do `npm update X || pip install X || apt install X`) — this is dangerous because different package managers may install completely different packages with the same name.
+Each step is ONE action. Wait for results before proceeding to the next step.
 
 Schema reference (Response):
 {
@@ -97,7 +112,7 @@ Schema reference (Response):
         "command": "bash command here",
         "purpose": "why",
         "shell": "bash",
-        "run_as": "root",
+        "run_as": "<current_user_from_context>",
         "exec_mode": "sync" | "streaming" | "fire_forget" | "context_shift",
         "timeout_s": 30,
         "on_timeout": "kill_collect" | "signal_then_collect" | "abandon" | "ask",
@@ -109,7 +124,7 @@ Schema reference (Response):
   }
 }
 
-Schema reference (Clarification):
+Schema reference (Clarification — USE SPARINGLY, see rules below):
 {
   "proto_version": "1.1",
   "msg_id": "<uuid>",
@@ -121,7 +136,7 @@ Schema reference (Clarification):
   "payload": {
     "type": "clarification",
     "needs": [
-      {"what": "target directory", "why": "to know where to copy", "required": true}
+      {"what": "which of the 3 matching services to restart", "why": "restarting the wrong one could cause downtime", "required": true}
     ]
   }
 }
@@ -144,17 +159,36 @@ Schema reference (FetchChunk for large output pagination):
 
 - For simple answers without executing commands, use "type": "response" with "response_type": "answer" and empty "actions".
 - Use `action_id` (string slug) for action correlation, NOT integers.
+- `run_as` MUST match the current user from the context (e.g. "neo"). Only set "root" when the command genuinely requires sudo (e.g. systemctl, apt install, modifying /etc). Using "root" causes sudo which resets environment variables and can break commands that depend on user-level config.
 - For potentially hanging commands, use `timeout_s` proactively.
 - If handling chunked output results from the Executor, use "type": "fetch_chunk" to request subsequent lines.
 - If switching active environments (e.g. docker exec), set `exec_mode": "context_shift" or "expect_context_push": true.
 
-When you use type: "clarification", always provide a sensible DEFAULT:
-  "needs": [{ "what": "...", "why": "...", "default": "<safe_default>", "default_label": "current dir" }]
+CLARIFICATION — LAST RESORT ONLY: Only use "type": "clarification" when ALL of these are true:
+1. The user's intent is genuinely ambiguous (not just unfamiliar to you).
+2. Running an exploratory command (which, find, ls, cat, dpkg, etc.) would NOT resolve the ambiguity.
+3. Making the wrong assumption could cause irreversible harm (data loss, wrong service restarted, etc.).
+If none of those apply, DO NOT clarify — just act. Prefer running a safe exploratory command over asking.
+When you DO use clarification, always provide a sensible DEFAULT:
+  "needs": [{ "what": "...", "why": "...", "default": "<safe_default>", "default_label": "..." }]
 The default is used when the human cannot respond (piped/headless mode).
 If interactive: false, you MUST NOT emit clarifications without a DEFAULT.
 If pipe_position: "head", your final output is going to another process (emit raw data, not prose).
 - When receiving a query with `intent: "clarify_response"`, this is the user's answer to your previous clarification. You MUST process their answer along with the previous context, and immediately formulate and execute the required bash commands. Do not ask for clarification on the same topic again.
 If pipe_position: "tail", your input is machine-generated data from stdin."#.to_string();
+
+        // Append plugin capability descriptions to the system prompt
+        if let Some(ref pm) = plugin_manager {
+            let cap = pm.capability_prompt();
+            if !cap.is_empty() {
+                system_prompt.push_str(&cap);
+                if std::env::var("DIG_DEBUG").is_ok() {
+                    eprintln!("[DIG_DEBUG] Plugin capabilities appended to system prompt ({} chars, {} plugins)", cap.len(), pm.enabled_plugins().len());
+                }
+            }
+        } else if std::env::var("DIG_DEBUG").is_ok() {
+            eprintln!("[DIG_DEBUG] No plugin manager loaded");
+        }
 
         Self {
             provider,
@@ -174,6 +208,8 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
             dry_run: false,
             no_cache: false,
             no_memory: false,
+            plugin_manager,
+            current_query: String::new(),
         }
     }
 
@@ -232,6 +268,7 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                 ));
             }
         };
+        self.current_query = user_query.clone();
         let payload_json = serde_json::to_string_pretty(envelope)
             .unwrap_or_else(|_| "Error serializing payload".into());
 
@@ -618,6 +655,54 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
 
                             for action in resp.actions {
                                 info!(action_id = %action.action_id, command = %action.command, "Executing BrainAction");
+
+                                // Plugin interception: handle dig-plugin commands
+                                // Plugins are always permitted (no sandbox cost)
+                                if let Some((plugin_name, plugin_args)) =
+                                    PluginManager::parse_plugin_command(&action.command)
+                                {
+                                    if let Some(ref pm) = self.plugin_manager {
+                                        let cwd = std::env::current_dir()
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|_| ".".to_string());
+                                        let plugin_output = pm
+                                            .execute(
+                                                &plugin_name,
+                                                &plugin_args,
+                                                &cwd,
+                                                &self.current_query,
+                                            )
+                                            .await;
+                                        let output_text = match plugin_output {
+                                            Ok(text) => text,
+                                            Err(e) => format!("Plugin error: {}", e),
+                                        };
+                                        sent_output_back = true;
+                                        batch_results.push(crate::protocol::BatchResult {
+                                            action_id: action.action_id.clone(),
+                                            exit_code: 0,
+                                            content: crate::protocol::OutputContent::Direct {
+                                                stdout: output_text,
+                                                stderr: String::new(),
+                                            },
+                                            duration_ms: 0,
+                                        });
+                                        continue;
+                                    } else {
+                                        sent_output_back = true;
+                                        batch_results.push(crate::protocol::BatchResult {
+                                            action_id: action.action_id.clone(),
+                                            exit_code: 1,
+                                            content: crate::protocol::OutputContent::Direct {
+                                                stdout: String::new(),
+                                                stderr: "No plugins loaded.".to_string(),
+                                            },
+                                            duration_ms: 0,
+                                        });
+                                        continue;
+                                    }
+                                }
+
                                 let permitted = self
                                     .permitter
                                     .check_permission(&action.command, &[])
@@ -791,6 +876,7 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                         if !res.success {
                                             break; // Halt on failure
                                         }
+
                                     }
                                     Err(e) => {
                                         sent_output_back = true;
@@ -807,6 +893,7 @@ If pipe_position: "tail", your input is machine-generated data from stdin."#.to_
                                     }
                                 }
                             }
+
 
                             if !batch_results.is_empty() {
                                 let payload = crate::protocol::ExecutorPayload::ActionResults(

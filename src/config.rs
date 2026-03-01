@@ -69,6 +69,26 @@ pub fn load_config(override_path: Option<&Path>) -> Result<AppConfig> {
     Ok(config)
 }
 
+/// Resolve the plugins directory path.
+/// Uses `$DIG_CONFIG_DIR/plugins/` if set, otherwise `~/.config/dig/plugins/`.
+pub fn plugins_dir() -> Option<std::path::PathBuf> {
+    if let Ok(config_dir) = std::env::var("DIG_CONFIG_DIR") {
+        let dir = std::path::Path::new(&config_dir).join("plugins");
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join(".config").join("dig").join("plugins");
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+
+    None
+}
+
 /// Load the tool manifest.
 /// If `config_dir` is provided, look for tools.toml in that directory.
 pub fn load_tools(config_dir: Option<&Path>) -> Result<Vec<ToolManifestEntry>> {
